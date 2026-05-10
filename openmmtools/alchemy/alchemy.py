@@ -457,7 +457,14 @@ class AlchemicalRegion(collections.namedtuple('AlchemicalRegion', _ALCHEMICAL_RE
         atoms. Improper torsions are not softened (default is None).
     annihilate_electrostatics : bool, optional
         If True, electrostatics should be annihilated, rather than decoupled
-        (default is True).
+        (default is True). When set to False with
+        ``alchemical_pme_treatment='exact'`` on the factory, a 
+        ``CustomNonbondedForce`` is added that preserves the alchemical
+        molecule's intramolecular direct-space Coulomb interactions at every
+        value of ``lambda_electrostatics``. The reciprocal-space
+        alchemical/alchemical contribution is still removed, 
+        which can matter for charged or strongly polar alchemical
+        regions.
     annihilate_sterics : bool, optional
         If True, sterics (Lennard-Jones or Halgren potential) will be annihilated,
         rather than decoupled (default is False).
@@ -521,12 +528,18 @@ class AbsoluteAlchemicalFactory:
         Options are ['direct-space', 'coulomb', 'exact'].
         - 'direct-space' only models the direct space contribution
         - 'coulomb' includes switched Coulomb interaction
-        - 'exact' includes also the reciprocal space contribution, but it's
-           only possible to annihilate the charges and the softcore parameters
-           controlling the electrostatics are deactivated. Also, with this
-           method, modifying the global variable `lambda_electrostatics` is
-           not sufficient to control the charges. The recommended way to change
-           them is through the `AlchemicalState` class.
+        - 'exact' includes also the reciprocal space contribution. Softcore
+           parameters controlling the electrostatics are deactivated and
+           ``consistent_exceptions`` must be False. Both annihilation
+           (``annihilate_electrostatics=True``) and decoupling
+           (``annihilate_electrostatics=False``) of a single alchemical region
+           are supported. In the decoupling case, the alchemical molecule's
+           intramolecular direct-space Coulomb interactions are preserved via a
+           ``CustomNonbondedForce`` that uses CutoffPeriodic.
+           Also, with this method, modifying the global variable
+           ``lambda_electrostatics`` is not sufficient to control the charges.
+           The recommended way to change them is through the ``AlchemicalState``
+           class.
     alchemical_rf_treatment : str, optional, default = 'switched'
         Controls how alchemical region electrostatics are treated when RF is used
         Options are ['switched', 'shifted']
@@ -1624,12 +1637,15 @@ class AbsoluteAlchemicalFactory:
         if use_exact_pme_treatment:
             for alchemical_region in alchemical_regions:
                 err_msg = ' not supported with exact treatment of Ewald electrostatics.'
-                if not alchemical_region.annihilate_electrostatics:
-                    raise ValueError('Decoupled electrostatics is' + err_msg)
                 if self.consistent_exceptions:
                     raise ValueError('Consistent exceptions are' + err_msg)
                 if (alchemical_region.softcore_beta, alchemical_region.softcore_d, alchemical_region.softcore_e) != (0, 1, 1):
                     raise ValueError('Softcore electrostatics is' + err_msg)
+                
+                # Multi-region pair decoupling is not implemented.
+                if (not alchemical_region.annihilate_electrostatics) and len(alchemical_regions_interactions) > 0:
+                    raise ValueError('Decoupled electrostatics with exact PME is currently '
+                                     'only supported for non-interactiong alchemical regions.')
 
         # Create a copy of the NonbondedForce to handle particle interactions and
         # 1,4 exceptions between non-alchemical/non-alchemical atoms (nn).
@@ -1748,6 +1764,9 @@ class AbsoluteAlchemicalFactory:
             # na_electrostatics_custom_bond_force      | electrostatics exceptions non-alchemical/alchemical   |
             #                                          | (only without exact PME treatment)                    |
             # --------------------------------------------------------------------------------------------------
+            # aa_intramolecular_coulomb_force         | intramolecular electrostatics alchemical/alchemical    |
+            #                                         | (only with exact PME treatment AND decoupling)                       |
+            # --------------------------------------------------------------------------------------------------
 
             def create_force(force_cls, energy_expression, lambda_variable_name, lambda_var_suffixes, is_lambda_controlled):
                 """Shortcut to create a lambda-controlled custom forces."""
@@ -1832,6 +1851,37 @@ class AbsoluteAlchemicalFactory:
                 else:
                     force.setNonbondedMethod(nonbonded_force.getNonbondedMethod())
 
+            # When decoupling with exact PME, build a CustomNonbondedForce
+            # that restores the alchemical-alchemical Coulomb interactions using CutoffPeriodic.
+            # We add back (1 - lambda_electrostatics**2) * Coulomb 
+            # so the intramolecular full-real space is preserved at every value of lambda.
+            # Be aware that the long-range interactions between periodic images
+            # of the alchemical regions are not preserved.
+            
+            decouple_exact_pme = (use_exact_pme_treatment
+                                   and len(lambda_var_suffixes) == 1
+                                   and not alchemical_region.annihilate_electrostatics)
+            
+            aa_intramolecular_coulomb_force = None
+
+            if decouple_exact_pme:
+                ONE_4PI_EPS0 = 138.935458  # kJ/mol nm/e^2
+                aa_intramolecular_coulomb_force_parameter = f'lambda_electrostatics{lambda_var_suffixes[0]}'
+                aa_intramolecular_coulomb_force = openmm.CustomNonbondedForce(
+                    f'(1.0 - {aa_intramolecular_coulomb_force_parameter}*{aa_intramolecular_coulomb_force_parameter}) * ONE_4PI_EPS0 * charge1 * charge2 / r;'
+                    f'ONE_4PI_EPS0 = {ONE_4PI_EPS0:.16e};'
+                )
+                aa_intramolecular_coulomb_force.addGlobalParameter(aa_intramolecular_coulomb_force_parameter, 1.0)
+                aa_intramolecular_coulomb_force.addPerParticleParameter('charge')
+                aa_intramolecular_coulomb_force.setCutoffDistance(nonbonded_force.getCutoffDistance())
+                aa_intramolecular_coulomb_force.setUseSwitchingFunction(False)
+                aa_intramolecular_coulomb_force.setUseLongRangeCorrection(False)
+                aa_intramolecular_coulomb_force.setNonbondedMethod(
+                    openmm.CustomNonbondedForce.CutoffPeriodic 
+                    if is_periodic_method
+                    else openmm.CustomNonbondedForce.CutoffNonPeriodic
+                )
+
             # Create CustomBondForces to handle sterics 1,4 exceptions interactions between
             # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
             # to 1.0 for decoupled interactions in alchemical/alchemical force.
@@ -1893,6 +1943,11 @@ class AbsoluteAlchemicalFactory:
                 # Set electrostatics parameters in CustomNonbondedForces.
                 for force in all_electrostatics_custom_nonbonded_forces:
                     force.addParticle([charge, sigma])
+
+                # Add all the particles; later we will fix which pair to evaluate via addInteractionGroup()
+                if aa_intramolecular_coulomb_force is not None:
+                    aa_intramolecular_coulomb_force.addParticle([charge])
+
                 # Set offset parameters in NonbondedForce.
                 if use_exact_pme_treatment and particle_index in alchemical_atomsets[0] and len(lambda_var_suffixes) == 1:
                     nonbonded_force.addParticleParameterOffset(f'lambda_electrostatics{lambda_var_suffixes[0]}',
@@ -1917,6 +1972,14 @@ class AbsoluteAlchemicalFactory:
             logger.debug('Adding a steric interaction group between group {} and {}.'.format(lambda_var_suffixes[0],
                                                                                                lambda_var_suffixes[-1]))
             aa_sterics_custom_nonbonded_force.addInteractionGroup(alchemical_atomsets[0], alchemical_atomsets[-1])
+
+            # Add interaction groups, such that we only evaluate interactions between alchemical atoms.
+            # (see https://docs.openmm.org/latest/api-python/generated/openmm.openmm.CustomNonbondedForce.html#)
+            #  1-4 interactions are added later as exclusions.
+            if aa_intramolecular_coulomb_force is not None:
+                aa_intramolecular_coulomb_force.addInteractionGroup(
+                    alchemical_atomsets[0], alchemical_atomsets[0]
+                )
 
             # Electrostatics
             if not use_exact_pme_treatment:
@@ -1948,12 +2011,15 @@ class AbsoluteAlchemicalFactory:
                 # must have the same number of exceptions/exclusions on CUDA platform.
                 for force in all_custom_nonbonded_forces:
                     force.addExclusion(iatom, jatom)
+                # add exclusions for intramolecular coulomb force
+                if aa_intramolecular_coulomb_force is not None:
+                    aa_intramolecular_coulomb_force.addExclusion(iatom, jatom)
 
                 # Check if this is an exception or an exclusion
                 is_exception_epsilon = abs(epsilon.value_in_unit_system(unit.md_unit_system)) > 0.0
                 is_exception_chargeprod = abs(chargeprod.value_in_unit_system(unit.md_unit_system)) > 0.0
 
-                # Check how many alchemical atoms we have in the exception.
+                # Check how many alchemical regions we have in the exception.
                 if len(lambda_var_suffixes) > 1:
                     # Pair of interacting alchemical regions, therefore they are both alchemical or neither alchemical.
                     both_alchemical = ((iatom in alchemical_atomsets[0] and jatom in alchemical_atomsets[1]) or
@@ -1977,9 +2043,14 @@ class AbsoluteAlchemicalFactory:
 
                     # If this is an electrostatic exception and we're using exact PME,
                     # we just have to add the exception offset to the NonbondedForce.
+                    # For alchemical-alchemical 1-4 exceptions when decoupling with exact PME, leave the
+                    # chargeprod intact (by not adding an offset) so the intramolecular 1-4 Coulomb are not scaled.
                     if use_exact_pme_treatment and at_least_one_alchemical and is_exception_chargeprod:
-                        nonbonded_force.addExceptionParameterOffset(f'lambda_electrostatics{lambda_var_suffixes[0]}',
-                                                                    exception_index, chargeprod, 0.0, 0.0)
+                        if not (decouple_exact_pme and both_alchemical):
+                            nonbonded_force.addExceptionParameterOffset(
+                                f'lambda_electrostatics{lambda_var_suffixes[0]}',
+                                exception_index, chargeprod, 0.0, 0.0
+                            )
 
                 # If exception (and not exclusion), add special CustomBondForce terms to
                 # handle alchemically-modified Lennard-Jones and electrostatics exceptions
@@ -2001,9 +2072,14 @@ class AbsoluteAlchemicalFactory:
                 # Turn off all exception contributions from alchemical atoms in the NonbondedForce
                 # modelling non-alchemical atoms only. We need to do it only once per single
                 # region so we don't repeat it when dealing with pairs of interacting regions.
+                # However, when decoupling with exact PME, retain the original chargeprod for aa 1-4
                 if at_least_one_alchemical:
-                    nonbonded_force.setExceptionParameters(exception_index, iatom, jatom,
-                                                           abs(0.0*chargeprod), sigma, abs(0.0*epsilon))
+                    # remain unchanged if decoupling under exact PME
+                    new_chargeprod = chargeprod if (decouple_exact_pme and both_alchemical and is_exception_chargeprod) else abs(0.0*chargeprod)
+                    nonbonded_force.setExceptionParameters(
+                        exception_index, iatom, jatom,
+                        new_chargeprod, sigma, abs(0.0*epsilon)
+                    )
 
             # Add global parameters to forces.
             def add_global_parameters(force):
@@ -2030,6 +2106,11 @@ class AbsoluteAlchemicalFactory:
             else:
                 forces_by_lambda[f'lambda_electrostatics{lambda_var_suffixes[0]}'] = all_electrostatics_custom_nonbonded_forces + all_electrostatics_custom_bond_forces
                 forces_by_lambda[f'lambda_sterics{lambda_var_suffixes[0]}'] = all_sterics_custom_nonbonded_forces + all_sterics_custom_bond_forces
+            
+            # add intramolecular coulomb force.
+            if aa_intramolecular_coulomb_force is not None:
+                forces_by_lambda[f'lambda_electrostatics{lambda_var_suffixes[0]}'].append(
+                    aa_intramolecular_coulomb_force)
 
         if use_exact_pme_treatment:
             forces_by_lambda[f'lambda_electrostatics{lambda_var_suffixes[0]}'].append(nonbonded_force)
@@ -2543,3 +2624,4 @@ if __name__ == '__main__':
     import doctest
     doctest.testmod()
     # doctest.run_docstring_examples(AlchemicalFunction, globals())
+
