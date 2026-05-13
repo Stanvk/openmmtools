@@ -3156,6 +3156,93 @@ class TestAlchemicalState:
             deserialized_state = utils.deserialize(serialization)
             assert pickle.dumps(compound_state) == pickle.dumps(deserialized_state)
 
+    def test_decoupling_electrostatics_exact_pme(self):
+        """
+        Test electrostatic decoupling under exact PME.
+
+        The test performs two single-point calculations on alanine dipeptide:
+        
+        1. At lambda_electrostatics=1 the decoupled system reproduces the annihilated system exactly.
+        
+        2. At lambda_electrostatics=0 the intramoleular coulomb interactions persists in the decoupled system
+            while they are completely annihilated in the annihilated system.
+
+        """
+
+        test_system = testsystems.AlanineDipeptideExplicit(nonbondedMethod=openmm.app.PME, use_dispersion_correction=False, switch=False, nonbondedCutoff=1.*unit.nanometer)
+        reference_system = test_system.system
+        positions = test_system.positions
+        alchemical_atoms = list(range(22))  # alanine dipeptide
+
+        factory = AbsoluteAlchemicalFactory(alchemical_pme_treatment="exact")
+        
+        decoupled_system = factory.create_alchemical_system(
+            reference_system,
+            AlchemicalRegion(alchemical_atoms=alchemical_atoms, annihilate_electrostatics=False)
+        )
+
+        annihilated_system = factory.create_alchemical_system(
+            reference_system,
+            AlchemicalRegion(alchemical_atoms=alchemical_atoms, annihilate_electrostatics=True)
+        )
+
+        def set_lambda(system, lambda_electrostatics):
+            state = AlchemicalState.from_system(system)
+            state.lambda_electrostatics = lambda_electrostatics
+            state.lambda_sterics = 1.0
+            state.apply_to_system(system)
+
+        def intramolecular_contribution_alaninedipeptide(positions):
+            reference_system = testsystems.AlanineDipeptideVacuum(nonbondedMethod=openmm.app.NoCutoff, use_dispersion_correction=False, switch=False, nonbondedCutoff=1.0*unit.nanometer)
+
+            for force in reference_system.system.getForces():
+                if isinstance(force, openmm.NonbondedForce):
+                    force.setForceGroup(18)
+
+                    # We only want to keep the electrostatic intramolecular contribution
+                    for i in range(force.getNumParticles()):
+                        charge, _, _ = force.getParticleParameters(i)
+                        force.setParticleParameters(i, charge, 0, 0)
+
+                    # Same holds for exceptions
+                    for exception_id in range(force.getNumExceptions()):
+                        i, j, qprod, _, _ = force.getExceptionParameters(exception_id)
+                        force.setExceptionParameters(exception_id, i, j, qprod, 0, 0)
+
+            return compute_energy(reference_system.system, positions, force_group={18})
+
+        # get force parameters of decoupled
+        # particle_parameters_decoupled = []
+        # for force in decoupled_system.getForces():
+        #     if isinstance(force, openmm.NonbondedForce):
+        #         for i in range(alchemical_atoms[-1]+1):
+        #             particle_parameters_decoupled.append(force.getParticleParameters(i))
+
+
+        # Test 1: lambda_electrostatics=1 reproduces the reference exactly.
+        set_lambda(decoupled_system, 1.0)
+        u_reference = compute_energy(reference_system, positions) # annihilated electrostatics
+        u_decoupled_lambda1 = compute_energy(decoupled_system, positions) # decoupled electrostatics
+        assert_almost_equal(
+            u_decoupled_lambda1, u_reference,
+            "Coupled and reference energy under exact PME "
+        )
+
+        # Test 2: lambda_electrostatics=0 reproduces the vacuum intramolecular Coulomb of the alchemical region.
+        set_lambda(decoupled_system, 0.0)
+        set_lambda(annihilated_system, 0.0)
+        u_decoupled_lambda0 = compute_energy(decoupled_system, positions)
+        u_annihilated_lambda0 = compute_energy(annihilated_system, positions)
+
+        expected_diff = intramolecular_contribution_alaninedipeptide(positions[:len(alchemical_atoms)])#, particle_parameters_decoupled)
+        actual_diff = u_decoupled_lambda0 - u_annihilated_lambda0
+        assert_almost_equal(
+            actual_diff, expected_diff,
+            "Decoupled and annihilated energy difference and expected difference under exact PME"
+        )
+
+        assert abs(expected_diff) > MAX_DELTA, "Expected difference is too small to be detected in the test"
+
 
 # =============================================================================
 # MAIN FOR MANUAL DEBUGGING
