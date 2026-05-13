@@ -3211,14 +3211,6 @@ class TestAlchemicalState:
 
             return compute_energy(reference_system.system, positions, force_group={18})
 
-        # get force parameters of decoupled
-        # particle_parameters_decoupled = []
-        # for force in decoupled_system.getForces():
-        #     if isinstance(force, openmm.NonbondedForce):
-        #         for i in range(alchemical_atoms[-1]+1):
-        #             particle_parameters_decoupled.append(force.getParticleParameters(i))
-
-
         # Test 1: lambda_electrostatics=1 reproduces the reference exactly.
         set_lambda(decoupled_system, 1.0)
         u_reference = compute_energy(reference_system, positions) # annihilated electrostatics
