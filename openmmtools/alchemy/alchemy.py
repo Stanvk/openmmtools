@@ -1865,6 +1865,9 @@ class AbsoluteAlchemicalFactory:
             aa_intramolecular_coulomb_force = None
 
             if decouple_exact_pme:
+                import warnings
+                warnings.warn("Decoupling electrostatics with exact PME is experimental and not thoroughly tested yet. Please use with caution!")
+
                 ONE_4PI_EPS0 = 138.935458  # kJ/mol nm/e^2
                 aa_intramolecular_coulomb_force_parameter = f'lambda_electrostatics{lambda_var_suffixes[0]}'
                 aa_intramolecular_coulomb_force = openmm.CustomNonbondedForce(
